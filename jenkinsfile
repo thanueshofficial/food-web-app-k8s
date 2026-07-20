@@ -1,0 +1,162 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk'
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonar-scanner'
+
+        DOCKER_IMAGE = "thanuesh13/food-app"
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+
+        // New K8s Manifest Repo URL and Directory
+        K8S_REPO = "https://github.com/thanueshofficial/food-web-app-k8s.git"
+        K8S_DIR = "k8s"
+        DEPLOYMENT_FILE = "k8s/deployment.yaml"
+    }
+
+    stages {
+
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Application Code') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'github-token',
+                    url: 'https://github.com/thanueshofficial/food-web-app.git'
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh '''
+                    $SCANNER_HOME/bin/sonar-scanner \
+                    -Dsonar.projectName=food-app \
+                    -Dsonar.projectKey=food-app
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                script {
+                    waitForQualityGate(
+                        abortPipeline: false,
+                        credentialsId: 'Sonar-token'
+                    )
+                }
+            }
+        }
+
+        stage('Trivy File System Scan') {
+            steps {
+                sh "trivy fs . > trivyfs.txt"
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                script {
+                    withDockerRegistry(
+                        credentialsId: 'docker',
+                        toolName: 'docker'
+                    ) {
+                        sh """
+                        docker build \
+                        -t ${DOCKER_IMAGE}:${IMAGE_TAG} .
+
+                        docker tag \
+                        ${DOCKER_IMAGE}:${IMAGE_TAG} \
+                        ${DOCKER_IMAGE}:latest
+
+                        docker push \
+                        ${DOCKER_IMAGE}:${IMAGE_TAG}
+
+                        docker push \
+                        ${DOCKER_IMAGE}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh """
+                trivy image \
+                ${DOCKER_IMAGE}:${IMAGE_TAG} \
+                > trivyimage.txt
+                """
+            }
+        }
+
+        stage('Update Kubernetes Deployment Manifest') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'github-token',
+                        usernameVariable: 'GIT_USERNAME',
+                        passwordVariable: 'GIT_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                    rm -rf ${K8S_DIR}
+
+                    # Clone the NEW manifests repository
+                    git clone https://${GIT_USERNAME}:${GIT_TOKEN}@github.com/thanueshofficial/food-web-app-k8s.git ${K8S_DIR}
+
+                    cd ${K8S_DIR}
+
+                    git config user.email "thanueshofficial@gmail.com"
+                    git config user.name "Jenkins CI"
+
+                    sed -i "s#image: .*#image: ${DOCKER_IMAGE}:${IMAGE_TAG}#g" ${DEPLOYMENT_FILE}
+
+                    git add ${DEPLOYMENT_FILE}
+                    git commit -m "Update food-app image tag to ${IMAGE_TAG}" || true
+                    git push origin main
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                def buildStatus = currentBuild.currentResult
+
+                emailext(
+                    subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                    <html>
+                    <body>
+                    <h3>Food App Kubernetes CI/CD Pipeline Status</h3>
+                    <p>Project: ${env.JOB_NAME}</p>
+                    <p>Build Number: ${env.BUILD_NUMBER}</p>
+                    <p>Status: ${buildStatus}</p>
+                    <p>Docker Image: ${env.DOCKER_IMAGE}:${env.IMAGE_TAG}</p>
+                    <p>Kubernetes Deployment Updated in Manifest Repo</p>
+                    <p>Argo CD will automatically sync changes</p>
+                    <p>Build URL: <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                    </body>
+                    </html>
+                    """,
+                    to: 'thanueshofficial@gmail.com',
+                    from: 'thanueshofficial@gmail.com',
+                    replyTo: 'thanueshofficial@gmail.com',
+                    mimeType: 'text/html',
+                    attachmentsPattern: 'trivyfs.txt,trivyimage.txt'
+                )
+            }
+        }
+    }
+}
